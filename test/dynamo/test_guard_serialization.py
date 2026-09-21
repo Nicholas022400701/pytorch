@@ -15,7 +15,7 @@ import types
 import unittest
 import weakref
 from collections.abc import Iterator
-from typing import Any, NamedTuple
+from typing import Any, Generic, NamedTuple, TypeVar
 from unittest import mock
 
 import torch
@@ -1095,9 +1095,14 @@ class TestGuardSerializationBase(torch._inductor.test_case.TestCase):
                 if key in kwargs and isinstance(kwargs[key], Iterator):
                     self._frame_state.f_locals[key] = kwargs[key]
 
+        # A single guard type, or a tuple of them when the case under test
+        # needs two (a by-value dict key: the key's own TYPE_MATCH puts it in
+        # the guard tree, DICT_KEYS_MATCH is what compares it by value).
+        kept = (guard_type,) if isinstance(guard_type, str) else tuple(guard_type)
+
         def guard_filter_fn(guards):
             ret = [
-                g.guard_type == guard_type or guard_type in g.derived_guard_types
+                g.guard_type in kept or any(t in g.derived_guard_types for t in kept)
                 for g in guards
             ]
             self.assertTrue(any(ret))
@@ -1198,6 +1203,90 @@ if torch.distributed.is_available():
         def __init__(self):
             super().__init__(0, 1)
             self.calls = []
+
+
+class _HolderWithGenerator:
+    def __init__(self):
+        self.it = (i for i in range(3))
+        self.cfg = {"a": 1}
+
+
+_T = TypeVar("_T")
+
+
+class _GenericHolder(Generic[_T]):
+    # typing.Generic declares an empty __slots__ (as abc.ABC does), which adds
+    # no instance state.
+    def __init__(self):
+        self.it = (i for i in range(3))
+        self.cfg = {"a": 1}
+
+
+@dataclasses.dataclass(frozen=True)
+class _KeyCfg:
+    # Hashable by name, compared by every field: a plain object that ends up as
+    # a dict key and is therefore compared by value at run time.
+    name: str
+    tags: list
+
+    def __hash__(self):
+        return hash(self.name)
+
+
+class _OuterHolder:
+    def __init__(self):
+        self.inner = _HolderWithGenerator()
+        self.name = "outer"
+
+
+@dataclasses.dataclass(frozen=True)
+class _ConstantCfg:
+    dims: tuple
+    tags: list
+
+    def __hash__(self):
+        return hash(self.dims)
+
+
+pytree.register_constant(_ConstantCfg)
+
+
+def _by_name_fn(x):
+    return x
+
+
+class _PipelineWithSetstate:
+    def __init__(self):
+        self.stages = ["a", "b"]
+        self.n = len(self.stages)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.n = len(self.stages)
+
+
+class _SlottedHolder:
+    __slots__ = ("tag", "__dict__")
+
+    def __init__(self):
+        self.tag = "slot"
+        self.extra = [1]
+
+
+class _AttrDict(dict):
+    pass
+
+
+class _TaggedList(list):
+    pass
+
+
+class _RebuiltFromNewargs:
+    def __init__(self, a):
+        self.a = a
+
+    def __getnewargs__(self):
+        return (self.a,)
 
 
 class _ModuleWithGenerators(torch.nn.Module):
@@ -1516,6 +1605,132 @@ class TestGuardsStatePickler(torch._inductor.test_case.TestCase):
             pickle.UnpicklingError, "unknown guards state persistent id 'foo'"
         ):
             load_guards_state(buf.getvalue())
+
+    def test_unguarded_bystander_on_a_guarded_user_object_is_pruned(self):
+        # Only nn.Module attributes were pruned; a guarded plain object holding
+        # one unpicklable bystander failed the whole dump.
+        h = _HolderWithGenerator()
+        buf = io.BytesIO()
+        GuardsStatePickler({id(h): h, id(h.cfg): h.cfg}, {}, {}, {}, buf).dump({"h": h})
+        out = load_guards_state(buf.getvalue())["h"]
+        self.assertIsInstance(out.it, _Missing)
+        self.assertEqual(out.cfg, {"a": 1})
+
+    def test_a_by_name_function_does_not_register_its_dict_values(self):
+        # A guarded module-level function is saved by reference, so its __dict__
+        # never travels; registering its values would only prune a shared object
+        # somewhere else in the state.
+        _by_name_fn.cache = {"k": 1}
+        pickler = GuardsStatePickler(
+            {id(_by_name_fn): _by_name_fn}, {}, {}, {}, io.BytesIO()
+        )
+        pickler.dump({"f": _by_name_fn})
+        self.assertNotIn(id(_by_name_fn.cache), pickler.missing_values)
+
+    def test_guarded_object_with_a_custom_setstate_is_pickled_whole(self):
+        # Attribute pruning assumes the default pickle protocol; a __setstate__
+        # that recomputes a field from an unguarded one would read _Missing.
+        p = _PipelineWithSetstate()
+        buf = io.BytesIO()
+        GuardsStatePickler({id(p): p}, {}, {}, {}, buf).dump({"p": p})
+        out = load_guards_state(buf.getvalue())["p"]
+        self.assertEqual((out.stages, out.n), (["a", "b"], 2))
+
+    def test_shared_value_is_pruned_only_inside_the_pruned_receiver(self):
+        # The pruned holder is rebuilt from a filtered copy of its own __dict__,
+        # so the list it shares with a pipeline that is pickled whole stays real
+        # where the pipeline's __setstate__ reads it back, in either pickle order.
+        for order in ("holder first", "pipeline first"):
+            shared = ["a", "b"]
+            p = _PipelineWithSetstate()
+            p.stages, p.n = shared, 2
+            h = _HolderWithGenerator()
+            h.data = shared
+            state = {"h": h, "p": p} if order == "holder first" else {"p": p, "h": h}
+            buf = io.BytesIO()
+            GuardsStatePickler(
+                {id(h): h, id(h.cfg): h.cfg, id(p): p}, {}, {}, {}, buf
+            ).dump(state)
+            out = load_guards_state(buf.getvalue())
+            self.assertEqual((out["p"].stages, out["p"].n), (["a", "b"], 2), order)
+            self.assertIsInstance(out["h"].data, _Missing, order)
+            self.assertIsInstance(out["h"].it, _Missing, order)
+
+    def test_slotted_object_is_pickled_whole(self):
+        # A receiver with __slots__ carries state outside __dict__, which the
+        # filtered-__dict__ rebuild would drop, so it is not pruned at all.
+        obj = _SlottedHolder()
+        buf = io.BytesIO()
+        GuardsStatePickler({id(obj): obj}, {}, {}, {}, buf).dump({"o": obj})
+        out = load_guards_state(buf.getvalue())["o"]
+        self.assertEqual((out.tag, out.extra), ("slot", [1]))
+
+    def test_dict_and_list_subclasses_are_pickled_whole(self):
+        # Their items ride the reduce tuple, not __dict__, and neither type has a
+        # hook to screen for; the layout check keeps them off the pruning path.
+        cfg, tags = _AttrDict(a=1), _TaggedList([1, 2])
+        cfg.tag, tags.name = "t", "n"
+        buf = io.BytesIO()
+        GuardsStatePickler({id(cfg): cfg, id(tags): tags}, {}, {}, {}, buf).dump(
+            {"cfg": cfg, "tags": tags}
+        )
+        out = load_guards_state(buf.getvalue())
+        self.assertEqual((dict(out["cfg"]), out["cfg"].tag), ({"a": 1}, "t"))
+        self.assertEqual((list(out["tags"]), out["tags"].name), ([1, 2], "n"))
+
+    def test_object_rebuilt_from_newargs_is_pickled_whole(self):
+        # __getnewargs__ feeds cls.__new__ through the same pickler, so a pruned
+        # attribute it returns would arrive as the sentinel.
+        obj = _RebuiltFromNewargs([1])
+        buf = io.BytesIO()
+        GuardsStatePickler({id(obj): obj}, {}, {}, {}, buf).dump({"o": obj})
+        self.assertEqual(load_guards_state(buf.getvalue())["o"].a, [1])
+
+    def test_torch_namespace_objects_are_pickled_whole(self):
+        # type(obj).__module__ == "torch" is torch's namespace too, so the
+        # exclusion must not stop at "torch."; the wrapper's config dict stays.
+        wrapper = torch._TorchCompileInductorWrapper("default", None, False)
+        buf = io.BytesIO()
+        GuardsStatePickler({id(wrapper): wrapper}, {}, {}, {}, buf).dump({"w": wrapper})
+        loaded = load_guards_state(buf.getvalue())["w"]
+        self.assertEqual(loaded.config, wrapper.config)
+        self.assertEqual(loaded.dynamic, wrapper.dynamic)
+
+    def test_unguarded_bystander_on_a_generic_subclass_is_pruned(self):
+        # An empty __slots__ on a base (typing.Generic, abc.ABC) is not state;
+        # the gate must still reach the object.
+        h = _GenericHolder()
+        buf = io.BytesIO()
+        GuardsStatePickler({id(h): h, id(h.cfg): h.cfg}, {}, {}, {}, buf).dump({"h": h})
+        out = load_guards_state(buf.getvalue())["h"]
+        self.assertIsInstance(out.it, _Missing)
+        self.assertEqual(out.cfg, {"a": 1})
+
+    def test_bystander_several_levels_down_is_pruned(self):
+        # The guard tree reaches the inner holder through the outer one; the
+        # generator two levels down is pruned, what the guards read survives.
+        o = _OuterHolder()
+        buf = io.BytesIO()
+        GuardsStatePickler(
+            {id(o): o, id(o.inner): o.inner, id(o.inner.cfg): o.inner.cfg},
+            {},
+            {},
+            {},
+            buf,
+        ).dump({"o": o})
+        out = load_guards_state(buf.getvalue())["o"]
+        self.assertIsInstance(out.inner.it, _Missing)
+        self.assertEqual(out.inner.cfg, {"a": 1})
+        self.assertEqual(out.name, "outer")
+
+    def test_registered_constant_object_is_pickled_whole(self):
+        # EQUALS_MATCH keeps a pytree-registered constant itself and compares it
+        # by value at run time, so pruning its unguarded list field would make
+        # the rebuilt guard miss forever.
+        c = _ConstantCfg((0, 1), ["a"])
+        buf = io.BytesIO()
+        GuardsStatePickler({id(c): c}, {}, {}, {}, buf).dump({"c": c})
+        self.assertEqual(load_guards_state(buf.getvalue())["c"], c)
 
     def test_an_unguarded_interned_singleton_is_not_pruned(self):
         # Pruning is keyed by id(): an unguarded module attribute holding
@@ -3830,6 +4045,38 @@ class TestGuardSerialization(TestGuardSerializationBase):
         self.assertIsInstance(loaded, torch.nn.LSTM)
         self.assertEqual(loaded._all_weights, lstm._all_weights)
         self.assertEqual(loaded._flat_weights_names, lstm._flat_weights_names)
+
+    def test_guarded_plain_object_with_a_generator_bystander_round_trips(self):
+        # The headline case through a real capture: the guard on h.cfg["a"]
+        # reaches the holder, its generator is pruned, and the loaded guards
+        # still pass against the original inputs.
+        def fn(h, x):
+            return x + h.cfg["a"]
+
+        h, x = _HolderWithGenerator(), torch.randn(2)
+        ref, loaded = self._test_serialization("EQUALS_MATCH", fn, h, x)
+        self._test_check_fn(ref, loaded, {"h": h, "x": x}, True)
+        state = load_guards_state(self._cached_guards_state).output_graph
+        self.assertIsInstance(state.local_scope["h"].it, _Missing)
+        self.assertEqual(state.local_scope["h"].cfg, {"a": 1})
+
+    def test_a_guarded_dict_key_travels_whole_and_its_guards_still_pass(self):
+        # A non-const dict key is compared by value at run time through the key
+        # manager, a door that does not go through GuardBuilder.EQUALS_MATCH;
+        # its own TYPE_MATCH puts it in the guard tree, so the pruning gate
+        # would hollow it and the rebuilt guard would miss forever.
+        def fn(d, x):
+            for v in d.values():
+                x = x + v
+            return x
+
+        d, x = {_KeyCfg("a", ["t"]): 1.0}, torch.randn(2)
+        ref, loaded = self._test_serialization(
+            ("TYPE_MATCH", "DICT_KEYS_MATCH"), fn, d, x
+        )
+        self._test_check_fn(ref, loaded, {"d": d, "x": x}, True)
+        state = load_guards_state(self._cached_guards_state).output_graph
+        self.assertEqual(next(iter(state.local_scope["d"])).tags, ["t"])
 
     def test_grad_mode(self):
         def fn(x):
