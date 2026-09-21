@@ -5124,9 +5124,20 @@ def _offending_value_path(state: Any, target: Any) -> str:
 
     The error names WHAT failed and never WHERE it lives, which in a large model
     means bisecting by hand across multi-minute captures. The pickler records
-    the object it was reducing, so this walks the guard state's two scopes
-    breadth-first and reports the first path holding THAT object -- by
-    identity, not by type, which would report a same-typed bystander instead.
+    the object it was reducing, so this walks the guard state breadth-first and
+    reports the first path holding THAT object -- by identity, not by type,
+    which would report a same-typed bystander instead.
+
+    Searched from ``state``, because that is what gets pickled. Rooting only at
+    the two scopes searched a handful of objects on a real capture while the
+    pickler walked the whole output graph, its guards and its guard-tree
+    values, so a value living anywhere else -- a lock on a compiler internal,
+    say -- was unreachable however well the scopes were preserved. The scopes
+    stay as SEEDS, ahead of ``state`` in the queue, so the common case still
+    reports the short readable path rather than a long one through the graph.
+    Guards are slotted dataclasses whose create_fn is a functools.partial, so
+    slots and partials are descended too; modules are not, since they pickle
+    by name and their dicts lead to the whole of sys.modules.
 
     A shared object is reported by the first path breadth-first search reaches,
     which need not be the one the pickler took. Best-effort by construction: it
@@ -5142,6 +5153,7 @@ def _offending_value_path(state: Any, target: Any) -> str:
         queue = collections.deque(
             [(f"local_scope[{k!r}]", v) for k, v in graph.local_scope.items()]
             + [(f"global_scope[{k!r}]", v) for k, v in graph.global_scope.items()]
+            + [("state", state)]
         )
         seen: set[int] = set()
         budget = _WALK_BUDGET
@@ -5154,6 +5166,10 @@ def _offending_value_path(state: Any, target: Any) -> str:
             seen.add(id(value))
             if value is target:
                 return f"\n  reached via: {path}"
+            if inspect.ismodule(value):
+                # Pickled by name, so nothing inside it is in the artifact; its
+                # dict leads to sys.modules and would saturate the walk.
+                continue
             children: list[tuple[str, Any]] = []
             # Per node: one object whose container read raises (a dict subclass,
             # a container mutated concurrently) must not end the whole walk nor
@@ -5163,6 +5179,10 @@ def _offending_value_path(state: Any, target: Any) -> str:
                 if isinstance(value, (list, tuple)):
                     items = itertools.islice(enumerate(value), budget)
                     children = [(f"{path}[{i}]", v) for i, v in items]
+                elif isinstance(value, OrderedSet):
+                    # GuardsSet.inner; not subscriptable, so spell the accessor.
+                    items = itertools.islice(enumerate(value), budget)
+                    children = [(f"list({path})[{i}]", v) for i, v in items]
                 elif isinstance(value, (set, frozenset)):
                     members = itertools.islice(value, budget)
                     children = [(f"{path}[<a member>]", v) for v in members]
@@ -5173,6 +5193,16 @@ def _offending_value_path(state: Any, target: Any) -> str:
                         else:
                             children.append((f"{path}[<a key>]", k))
                             children.append((f"{path}[<that key>]", v))
+                elif isinstance(value, functools.partial):
+                    # Guard.create_fn is a partial whose arguments the pickler walks.
+                    children.append((f"{path}.func", value.func))
+                    children += [
+                        (f"{path}.args[{i}]", v) for i, v in enumerate(value.args)
+                    ]
+                    children += [
+                        (f"{path}.keywords[{k!r}]", v)
+                        for k, v in value.keywords.items()
+                    ]
                 elif isinstance(value, types.FunctionType):
                     # A function a guard is rooted at is pickled by value,
                     # defaults, kwdefaults and closure cells included (its
@@ -5204,11 +5234,26 @@ def _offending_value_path(state: Any, target: Any) -> str:
             except Exception:
                 pass
             try:
-                children += [
-                    (f"{path}.{name}", child)
-                    for name, child in (_instance_dict(value) or {}).items()
-                    if not name.startswith("__")
-                ]
+                instance_dict = _instance_dict(value)
+                if instance_dict is not None:
+                    children += [
+                        (f"{path}.{name}", child)
+                        for name, child in instance_dict.items()
+                        if not name.startswith("__")
+                    ]
+                # A slotted object (Guard is a slots dataclass) keeps its state
+                # in the slots along the MRO, with or without a __dict__ beside
+                # them; read like _instance_dict, so no user __getattr__ runs.
+                for klass in type(value).__mro__:
+                    slots = klass.__dict__.get("__slots__", ())
+                    for name in (slots,) if isinstance(slots, str) else slots:
+                        if name.startswith("__"):
+                            continue
+                        try:
+                            child = object.__getattribute__(value, name)
+                        except Exception:  # an unset slot, a raising descriptor
+                            continue
+                        children.append((f"{path}.{name}", child))
             except Exception:
                 pass
             children = children[:budget]
