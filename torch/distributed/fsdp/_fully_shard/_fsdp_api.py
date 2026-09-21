@@ -201,7 +201,15 @@ class CPUOffloadPolicy(OffloadPolicy):
 
 @dataclass(frozen=True)
 class AllGatherInput:
-    r"""Describe one all-gather payload and its gathered layout.
+    r"""Describe one payload returned by an FSDP all-gather extension.
+
+    Return these records in the inputs of ``(inputs, metadata)`` from
+    ``fsdp_pre_all_gather``. Each rank's payload is concatenated along ``dim``
+    using its own shape, independently of the parameter's shard dimension.
+    For example, a payload of shape ``(2, F, D)`` with ``dim=1`` produces
+    ``(2, world_size * F, D)``. Scalar payloads are treated as shape ``(1,)``.
+    The gathered payload is optionally reshaped to ``output_size`` before
+    being passed to the unchanged ``fsdp_post_all_gather`` hook.
 
     Payloads must be flattenable with ``view(-1)``. Each rank must return the
     same payload shapes, dtypes, and layouts; extensions own any padding.
@@ -225,6 +233,9 @@ class AllGatherInput:
 @dataclass
 class ReduceScatterInput:
     r"""Describe a parameter group's reduce-scatter input layout and copy.
+
+    Returned by callbacks registered with
+    :meth:`torch.distributed.fsdp.FSDPModule.set_reduce_scatter_input_fn`.
 
     Attributes:
         padded_unsharded_sizes (Sequence[torch.Size]): Padded sizes in parameter
