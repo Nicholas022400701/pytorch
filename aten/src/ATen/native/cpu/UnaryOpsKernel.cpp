@@ -147,8 +147,63 @@ bool LogitMKLEnabled<float>() {
 #endif
 
 static void logit_kernel(TensorIteratorBase& iter, const Scalar& eps_scalar) {
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      kBFloat16, kHalf, iter.common_dtype(), "logit_cpu", [&]() {
+  const auto dtype = iter.common_dtype();
+  if (at::isReducedFloatingType(dtype)) {
+    // Compute in float and round once, as the CUDA kernel does: rounding
+    // 1 - x and x / (1 - x) to the input dtype loses the digits of a result
+    // near 0.
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(dtype, "logit_cpu_reduced_float", [&]() {
+      const float eps = eps_scalar.to<float>();
+      const Vectorized<float> kOneVec(1.0f);
+      if (eps < 0.0f) {
+        cpu_kernel_vec(
+            iter,
+            [](scalar_t a) -> scalar_t {
+              const float x = static_cast<float>(a);
+              return x == 1.0f ? std::numeric_limits<float>::infinity()
+                               : std::log(x / (1.0f - x));
+            },
+            [kOneVec](Vectorized<scalar_t> a) {
+              auto [a0, a1] = convert_to_float<scalar_t>(a);
+              a0 = (a0 / (kOneVec - a0)).log();
+              a1 = (a1 / (kOneVec - a1)).log();
+              return convert_from_float<scalar_t>(a0, a1);
+            });
+      } else {
+        const float lo = eps;
+        const float hi = 1.0f - eps;
+        const Vectorized<float> lo_vec(lo);
+        const Vectorized<float> hi_vec(hi);
+        cpu_kernel_vec(
+            iter,
+            [lo, hi](scalar_t a) -> scalar_t {
+              float x = static_cast<float>(a);
+              x = x < lo ? lo : (x > hi ? hi : x);
+              return x == 1.0f ? std::numeric_limits<float>::infinity()
+                               : std::log(x / (1.0f - x));
+            },
+            [kOneVec, lo_vec, hi_vec](Vectorized<scalar_t> a) {
+              auto [a0, a1] = convert_to_float<scalar_t>(a);
+              // Apply lo last so it wins when eps > 1 - eps, matching
+              // the scalar `x < lo ? lo : (x > hi ? hi : x)` priority.
+              a0 = Vectorized<float>::blendv(
+                  Vectorized<float>::blendv(a0, hi_vec, a0 > hi_vec),
+                  lo_vec,
+                  a0 < lo_vec);
+              a1 = Vectorized<float>::blendv(
+                  Vectorized<float>::blendv(a1, hi_vec, a1 > hi_vec),
+                  lo_vec,
+                  a1 < lo_vec);
+              a0 = (a0 / (kOneVec - a0)).log();
+              a1 = (a1 / (kOneVec - a1)).log();
+              return convert_from_float<scalar_t>(a0, a1);
+            });
+      }
+    });
+    return;
+  }
+  AT_DISPATCH_FLOATING_TYPES(
+      dtype, "logit_cpu", [&]() {
         const scalar_t eps = eps_scalar.to<scalar_t>();
         if (LogitMKLEnabled<scalar_t>() && at::hasMKL() && iter.is_contiguous()) {
           LogitMKLKernel<scalar_t>(eps, &iter);

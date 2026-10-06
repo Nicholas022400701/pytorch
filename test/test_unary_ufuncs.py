@@ -1931,6 +1931,22 @@ class TestUnaryUfuncsCpuOnly(TestCase):
             ref_flat[i] = torch.special.logit(x_flat[i : i + 1], eps=eps)
         self.assertEqual(got, ref)
 
+    # The float16 and bfloat16 kernels compute in float and round once, as the
+    # CUDA kernel does. Rounding 1 - x and x / (1 - x) to the input dtype loses
+    # the digits of a result near 0: logit(0.499756) was -0.000488 in float16
+    # for an exact -0.000977.
+    @dtypes(torch.float16, torch.bfloat16)
+    @parametrize("eps", [-1.0, 1e-3])
+    def test_logit_reduced_float_matches_float(self, device, dtype, eps):
+        # every finite value of the dtype in (0, 1)
+        x = torch.arange(-(2**15), 2**15, dtype=torch.int16, device=device)
+        x = x.view(dtype)
+        x = x[(x > 0) & (x < 1)]
+        expected = torch.special.logit(x.float(), eps=eps).to(dtype)
+        # a contiguous and a strided input, the two code paths of the kernel
+        for inp in (x, torch.stack([x, x], dim=1)[:, 0]):
+            self.assertEqual(torch.special.logit(inp, eps=eps), expected)
+
 
 class TestUnaryUfuncsCUDADevice(TestCase):
     hw_classification = HardwareClassification.CUDA
